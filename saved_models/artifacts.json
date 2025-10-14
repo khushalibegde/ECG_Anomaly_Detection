@@ -1,0 +1,10 @@
+{
+  "scaler_tab": "saved_models/scaler_tab.pkl",
+  "rf_full": "saved_models/rf_full.pkl",
+  "xgb_full": "saved_models/xgb_full.pkl",
+  "lgb_full": "saved_models/lgb_full.txt",
+  "meta_lr": "saved_models/meta_lr.pkl",
+  "hybrid_best": "saved_models/hybrid_best_binary.h5",
+  "hybrid_final": "saved_models/hybrid_final_binary.h5",
+  "label_mapping": "saved_models/label_mapping.json"
+}
