@@ -13,6 +13,11 @@ from scipy.stats import skew, kurtosis
 
 import matplotlib.pyplot as plt
 import streamlit as st
+try:
+    import tensorflow as tf  # noqa: F401
+    from tensorflow.keras.models import load_model
+except Exception:
+    load_model = None
 
 
 RAW_SIGNAL_LEN = 200
@@ -44,17 +49,29 @@ def load_models():
     rf_path = _resolve_path(artifacts.get("rf_full", ""))
     xgb_path = _resolve_path(artifacts.get("xgb_full", ""))
     meta_path = _resolve_path(artifacts.get("meta_lr", ""))
+    hybrid_path = None
+    if artifacts.get("hybrid_final"):
+        hybrid_path = _resolve_path(artifacts.get("hybrid_final", ""))
+    elif artifacts.get("hybrid_best"):
+        hybrid_path = _resolve_path(artifacts.get("hybrid_best", ""))
 
     scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
     rf_full = joblib.load(rf_path) if os.path.exists(rf_path) else None
     xgb_full = joblib.load(xgb_path) if os.path.exists(xgb_path) else None
     meta_lr = joblib.load(meta_path) if os.path.exists(meta_path) else None
+    hybrid = None
+    if hybrid_path and os.path.exists(hybrid_path) and load_model is not None:
+        try:
+            hybrid = load_model(hybrid_path)
+        except Exception:
+            hybrid = None
 
     return {
         "scaler": scaler,
         "rf": rf_full,
         "xgb": xgb_full,
         "meta": meta_lr,
+        "hybrid": hybrid,
     }
 
 
@@ -139,7 +156,22 @@ def build_meta_features(models, tab_scaled: np.ndarray) -> Tuple[np.ndarray, dic
 
 
 
-def predict_probability(beat: np.ndarray, rr_interval: Optional[float], models, meta_weight: float) -> Tuple[float, float, float, dict, dict]:
+def _predict_hybrid_prob(beat: np.ndarray, tab_scaled: np.ndarray, models) -> Optional[float]:
+    hybrid = models.get("hybrid")
+    if hybrid is None:
+        return None
+    sig = pad_or_trim(beat, RAW_SIGNAL_LEN).reshape(1, RAW_SIGNAL_LEN, 1).astype(np.float32)
+    tab = np.asarray(tab_scaled, dtype=np.float32)
+    try:
+        # Expecting [signal_input, tabular_input]
+        p = hybrid.predict([sig, tab], verbose=0)
+        return float(p.reshape(-1)[0])
+    except Exception as e:
+        st.warning(f"Hybrid model inference failed: {e}")
+        return None
+
+
+def predict_probability(beat: np.ndarray, rr_interval: Optional[float], models, w_meta: float) -> Tuple[float, float, float, float, dict, dict]:
     beat = pad_or_trim(beat, RAW_SIGNAL_LEN)
     features_vec, feature_dict = extract_features(beat, rr_interval)
 
@@ -160,9 +192,16 @@ def predict_probability(beat: np.ndarray, rr_interval: Optional[float], models, 
     available = [v for v in base_probs.values() if not np.isnan(v)]
     base_mean = float(np.mean(available)) if available else meta_prob
 
-    # Blend meta and base model predictions
-    final_prob = float(meta_weight * meta_prob + (1.0 - meta_weight) * base_mean)
-    return final_prob, meta_prob, base_mean, feature_dict, base_probs
+    # Hybrid model probability (if available)
+    hybrid_prob = _predict_hybrid_prob(beat, tab_scaled, models)
+
+    # Final ensemble: final = W_META * meta_prob + (1 - W_META) * hybrid_prob
+    if hybrid_prob is not None:
+        final_prob = float(w_meta * meta_prob + (1.0 - w_meta) * hybrid_prob)
+    else:
+        final_prob = float(0.3 * meta_prob + 0.7 * base_mean)
+
+    return final_prob, meta_prob, base_mean, (hybrid_prob if hybrid_prob is not None else np.nan), feature_dict, base_probs
 
 
 def plot_ecg_with_highlights(beat: np.ndarray, threshold: float = 2.0):
@@ -188,8 +227,8 @@ def plot_ecg_with_highlights(beat: np.ndarray, threshold: float = 2.0):
 
 # ----------------------------- UI -----------------------------
 st.set_page_config(page_title="ECG Anomaly Detector", page_icon="🫀", layout="centered")
-st.title("ECG Anomaly Detector (Meta-Stacked)")
-st.caption("Upload an ECG segment (200 samples preferred). The app extracts features and predicts Abnormal probability.")
+st.title("ECG Anomaly Detector (Final Ensemble: Meta + Hybrid)")
+st.caption("Upload an ECG segment (200 samples preferred). The app extracts features and predicts abnormal probability using meta-stacked classic ML and (if available) a hybrid deep model.")
 
 with st.sidebar:
     st.header("Models")
@@ -197,19 +236,20 @@ with st.sidebar:
     st.code(MODEL_DIR)
     models = load_models()
     base_loaded = [name for name in ["rf", "xgb"] if models.get(name) is not None]
-    ok = (models.get("scaler") is not None) and (models.get("meta") is not None) and (len(base_loaded) >= 1)
-    if ok:
-        st.success(f"Models loaded: scaler, meta, base={', '.join(base_loaded)}")
+    has_hybrid = models.get("hybrid") is not None
+    ok_meta = (models.get("scaler") is not None) and (models.get("meta") is not None) and (len(base_loaded) >= 1)
+    if ok_meta:
+        st.success(f"Loaded: scaler, meta, base=[{', '.join(base_loaded)}]{' + hybrid' if has_hybrid else ''}")
     else:
-        st.warning("Missing some models. Need scaler + meta + at least one base (RF/XGB).")
+        st.warning("Missing some models. Need scaler + meta + at least one base (RF/XGB). Hybrid is optional.")
 
-    meta_weight = st.slider(
-        "Meta weight in final blend",
-        min_value=0.1,
-        max_value=0.9,
-        value=0.3,
+    w_meta = st.slider(
+        "Final ensemble: W_META (meta vs hybrid)",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.5,
         step=0.05,
-        help="Final = meta_weight * meta_prob + (1 - meta_weight) * mean(base_probs)"
+        help="Final = W_META * meta_prob + (1 - W_META) * hybrid_prob. If hybrid unavailable, falls back to meta-base blend (0.3*meta + 0.7*base_mean)."
     )
 
 uploaded = st.file_uploader("Upload ECG file (.csv or .txt)", type=["csv", "txt"])
@@ -249,8 +289,8 @@ if uploaded is not None:
             plot_ecg_with_highlights(raw_vals)
 
             with st.spinner("Predicting..."):
-                prob, meta_prob, base_mean, feat_dict, base_probs = predict_probability(
-                    raw_vals, rr_val if rr_val > 0 else None, models, meta_weight
+                prob, meta_prob, base_mean, hybrid_prob, feat_dict, base_probs = predict_probability(
+                    raw_vals, rr_val if rr_val > 0 else None, models, w_meta
                 )
 
             st.subheader("Prediction")
@@ -260,12 +300,20 @@ if uploaded is not None:
 
             # Explain decision
             st.subheader("How this decision was made")
-            st.markdown(
-                f"- Final probability blends meta and base models ({', '.join(base_loaded)}).  \n"
-                f"- Blending: p = {meta_weight:.2f} × meta({meta_prob:.3f}) + {(1 - meta_weight):.2f} × base_mean({base_mean:.3f}).  \n"
-                f"- Decision rule: predict Abnormal if p ≥ 0.5, else Normal.  \n"
-                f"- For this sample: p = {prob:.3f} {'<' if prob < 0.5 else '≥'} 0.5 → {pred_label}."
-            )
+            if not np.isnan(hybrid_prob):
+                st.markdown(
+                    f"- Final ensemble: p = W_META × meta + (1 - W_META) × hybrid.  \n"
+                    f"- Blending: p = {w_meta:.2f} × meta({meta_prob:.3f}) + {(1 - w_meta):.2f} × hybrid({hybrid_prob:.3f}).  \n"
+                    f"- Decision rule: predict Abnormal if p ≥ 0.5, else Normal.  \n"
+                    f"- For this sample: p = {prob:.3f} {'<' if prob < 0.5 else '≥'} 0.5 → {pred_label}."
+                )
+            else:
+                st.markdown(
+                    f"- Hybrid model unavailable → fallback to meta and base models ({', '.join(base_loaded)}).  \n"
+                    f"- Fallback blending: p = 0.30 × meta({meta_prob:.3f}) + 0.70 × base_mean({base_mean:.3f}).  \n"
+                    f"- Decision rule: predict Abnormal if p ≥ 0.5, else Normal.  \n"
+                    f"- For this sample: p = {prob:.3f} {'<' if prob < 0.5 else '≥'} 0.5 → {pred_label}."
+                )
 
             st.caption("Base model probabilities (inputs to meta-learner / base_mean):")
             st.table(pd.DataFrame([base_probs]))
